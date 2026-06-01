@@ -1,0 +1,39 @@
+# ==========================================
+# C Compilation Artifacts
+# ==========================================
+*.exe
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.pdb
+
+# ==========================================
+# Python Runtime & Environments
+# ==========================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ==========================================
+# IDE & Local Workspace Settings
+# ==========================================
+# We ignore local history, but keep tasks.json if you want to share build configs
+.history/
+.ionide/
+*.code-workspace
+
+# ==========================================
+# Secrets & Local Configurations
+# ==========================================
+.env
+*.local
+config.json
