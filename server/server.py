@@ -10,6 +10,7 @@ class LiveTrackingHandler(http.server.SimpleHTTPRequestHandler):
         print(f"\n[+] Incoming Beacon Received from {self.client_address[0]}")
         print(f"    Requested Endpoint: {self.path}")
         print(f"    User-Agent: {self.headers.get('User-Agent')}")
+        print(f"    Host Metadata: {self.headers.get('X-Agent-Metadata', 'not provided')}")
         
         # Construct a simple mock task instruction
         mock_instruction = b"MVP_INITIAL_TEST_OK"
@@ -31,6 +32,7 @@ if __name__ == "__main__":
     # Allow the port to be immediately reused if the server restarts
     socketserver.TCPServer.allow_reuse_address = True
     
+    # Start the TCP server to listen for incoming connections
     with socketserver.TCPServer(("", PORT), LiveTrackingHandler) as httpd:
         try:
             httpd.serve_forever()

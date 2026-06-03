@@ -3,7 +3,7 @@ CC = x86_64-w64-mingw32-gcc
 CFLAGS = -Wall -Wextra -O2
 
 # Linker flags (Crucial for Windows networking)
-LDFLAGS = -lwininet
+LDFLAGS = -lwininet -lws2_32 -ladvapi32
 
 # Target executable name
 TARGET = agent.exe
